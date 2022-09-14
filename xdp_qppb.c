@@ -16,35 +16,6 @@
 #define XDP_ACTION_MAX (XDP_REDIRECT + 1)
 #endif
 
-#define PIN_NONE	0
-#define PIN_OBJECT_NS	1
-#define PIN_GLOBAL_NS	2
-/*
- * REFERENCE: bpf-examples/traffic-pacing-edit/iproute2_compat.h
- * The tc tool (iproute2) use another ELF map layout than libbpf, see struct
- * bpf_elf_map from iproute2, but struct bpf_map_def from libbpf have same
- * binary layout until "flags". Thus, BPF-progs can use both if careful.
- */
-struct bpf_elf_map {
-	__u32 type;
-	__u32 size_key;
-	__u32 size_value;
-	__u32 max_elem;
-	__u32 flags;
-	__u32 id;
-	__u32 pinning;
-};
-
-#define XDP_LPM_KEY_SIZE (sizeof(struct bpf_lpm_trie_key) + sizeof(__u32))
-struct bpf_elf_map SEC("maps") dscp_map = {
-	.type       = BPF_MAP_TYPE_LPM_TRIE,
-	.max_elem   = 100,
-	.size_key   = XDP_LPM_KEY_SIZE,
-	.size_value = sizeof(__u8),
-	.pinning    = PIN_GLOBAL_NS,      //sys/fs/bpf/tc/globals/dscp_map
-	.flags      = BPF_F_NO_PREALLOC,
-};
-
 enum qppb_bgp_policy {
 	BGP_POLICY_NONE = 0,
 	BGP_POLICY_DST = 1,
@@ -52,29 +23,45 @@ enum qppb_bgp_policy {
 	BGP_POLICY_MAX
 };
 
-/* Association between iface id and the configured mode */
-struct bpf_elf_map SEC("maps") qppb_mode_map = {
-	.type       = BPF_MAP_TYPE_ARRAY,
-	.max_elem   = 256,
-	.size_key   = sizeof(__u32),
-	.size_value = sizeof(__u32),
-	.pinning    = PIN_GLOBAL_NS,      //sys/fs/bpf/tc/globals/qppb_mode_map
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 64);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} qppb_mode_map SEC(".maps");
 
-/* This is the data record stored in the map */
 struct datarec {
 	__u64 rx_packets;
 	__u64 rx_bytes;
 };
 
-/* Keeps stats per (enum) xdp_action */
-struct bpf_elf_map SEC("maps") xdp_stats_map = {
-	.type       = BPF_MAP_TYPE_PERCPU_ARRAY,
-	.size_key   = sizeof(__u32),
-	.size_value = sizeof(struct datarec),
-	.max_elem   = XDP_ACTION_MAX,
-	.pinning    = PIN_OBJECT_NS,
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, XDP_ACTION_MAX);
+	__type(key, __u32);
+	__type(value, struct datarec);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} xdp_stats_map SEC(".maps");
+
+struct lpm_key4 {
+	__u32 prefixlen;
+	__u32 src;
 };
+
+union lpm_key4_u {
+	__u32 b32[2];
+	__u8 b8[8];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 100);
+	__type(key, struct lpm_key4);
+	__type(value, __u8);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} dscp_map SEC(".maps");
 
 static __always_inline
 __u32 xdp_stats_record_action(struct xdp_md *ctx, __u32 action)
@@ -123,27 +110,18 @@ int xdp_qppb_func(struct xdp_md *ctx)
 	int rc, action = XDP_PASS;
 	__u64 nh_off = sizeof(struct ethhdr);
 	__u16 h_proto = eth->h_proto;
-	__u32 iif = ctx->ingress_ifindex;
-	__u8 *mark, *qppb_mkey, qppb_mode;
-	union {
-		__u32 b32[2];
-		__u8 b8[8];
-	} key4;
+	__u32 iif = ctx->ingress_ifindex, *qppb_mkey;
+	__u8 *mark, qppb_mode;
+	union lpm_key4_u key4;
 
 	if (data + nh_off > data_end)
 		goto drop;
 	if ((void*)(iph + 1) > data_end)
 		goto drop;
 	if (iph->ttl <= 1)
-		goto out;
+		goto skip;
 	if (h_proto != bpf_htons(ETH_P_IP))
-		goto out;
-
-	// Using BGP_POLICY_DST by default, if xdp was attached
-	qppb_mkey = bpf_map_lookup_elem(&qppb_mode_map, &iif);
-	qppb_mode = qppb_mkey ? *qppb_mkey : BGP_POLICY_DST;
-	if (qppb_mode == BGP_POLICY_NONE)
-		goto out;
+		goto skip;
 
 	__builtin_memset(&fib_params, 0, sizeof(fib_params));
 	fib_params.family	= AF_INET;
@@ -156,6 +134,10 @@ int xdp_qppb_func(struct xdp_md *ctx)
 	fib_params.ipv4_src	= iph->saddr;
 	fib_params.ipv4_dst	= iph->daddr;
 
+	qppb_mkey = bpf_map_lookup_elem(&qppb_mode_map, &fib_params.ifindex);
+	qppb_mode = qppb_mkey ? *qppb_mkey : BGP_POLICY_NONE;
+	if (qppb_mode == BGP_POLICY_NONE)
+		goto skip;
 
 	rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
@@ -183,14 +165,14 @@ int xdp_qppb_func(struct xdp_md *ctx)
 	if (!mark)
 		goto out;
 
-	bpf_printk("Mark detected [%d]", *mark);
+	// bpf_printk("Mark detected [%d]", *mark);
 	ipv4_change_dsfield(iph, 0, *mark);
-
 out:
-        /* bpf_printk("bpf fib lookup %d\n", action); */
 	return xdp_stats_record_action(ctx, action);
 drop:
 	return xdp_stats_record_action(ctx, XDP_DROP);
+skip:
+	return action;
 }
 
 SEC("xdp_pass")
