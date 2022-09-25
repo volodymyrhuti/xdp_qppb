@@ -2,6 +2,7 @@
 #include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/if_ether.h>
+#include <linux/pkt_cls.h>
 #include <sys/socket.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -9,6 +10,7 @@
 /* REFERENCES:
  * linux/samples/bpf/xdp_fwd_kernel.c
  * linux/samples/bpf/xdp_router_ipv4.bpf.c
+ * linux/samples/bpf/xdp2skb_meta_kern.c
  * xdp-tutorial/packet-solutions/xdp_prog_kern_03.c
  */
 
@@ -99,18 +101,28 @@ static inline void ipv4_change_dsfield(struct iphdr *iph, __u8 mask, __u8 value)
 	iph->tos = dsfield;
 }
 
+struct meta_info {
+	__u8 mark;
+} __attribute__((aligned(4)));
+
 SEC("xdp_qppb")
 int xdp_qppb_func(struct xdp_md *ctx)
 {
-	void *data_end = (void *)(long)ctx->data_end;
-	void *data = (void *)(long)ctx->data;
-	struct bpf_fib_lookup fib_params;
-	struct iphdr *iph = data + sizeof(struct ethhdr);
-	struct ethhdr *eth = data;
 	int rc, action = XDP_PASS;
+	struct meta_info *meta;
+
+	rc = bpf_xdp_adjust_meta(ctx, -(int)sizeof(*meta));
+	if (rc < 0)
+		return XDP_ABORTED;
+
+	void *data_end         = (void *)(long)ctx->data_end;
+	void *data             = (void *)(long)ctx->data;
+	struct iphdr *iph      = data + sizeof(struct ethhdr);
+	struct ethhdr *eth     = data;
+	__u32 *qppb_mkey, iif = ctx->ingress_ifindex;
+	struct bpf_fib_lookup fib_params;
 	__u64 nh_off = sizeof(struct ethhdr);
 	__u16 h_proto = eth->h_proto;
-	__u32 iif = ctx->ingress_ifindex, *qppb_mkey;
 	__u8 *mark, qppb_mode;
 	union lpm_key4_u key4;
 
@@ -118,6 +130,10 @@ int xdp_qppb_func(struct xdp_md *ctx)
 		goto drop;
 	if ((void*)(iph + 1) > data_end)
 		goto drop;
+
+	meta = (void *)(long)ctx->data_meta;
+	if ((void*)(meta + 1) > data)
+		return XDP_ABORTED;
 	if (iph->ttl <= 1)
 		goto skip;
 	if (h_proto != bpf_htons(ETH_P_IP))
@@ -165,8 +181,9 @@ int xdp_qppb_func(struct xdp_md *ctx)
 	if (!mark)
 		goto out;
 
-	// bpf_printk("Mark detected [%d]", *mark);
 	ipv4_change_dsfield(iph, 0, *mark);
+	meta->mark = *mark;
+	// bpf_printk("XDP Mark detected [%d]", *mark);
 out:
 	return xdp_stats_record_action(ctx, action);
 drop:

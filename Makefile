@@ -3,11 +3,13 @@
 all:
 	clang -Ilibbpf/pkg/usr/include -target bpf \
 		-g -O2 -Wall -c xdp_qppb.c -o xdp_qppb.o
+	clang -Ilibbpf/pkg/usr/include -target bpf \
+		-g -O2 -Wall -c xdp_tc.c -o xdp_tc.o
 	echo "ip link set dev <iface> xdp obj xdp_qppb.o"
 
 prepare:
 	git submodule update --init --recursive && \
-	mkdir -p libbpf/pkg libbpf/build        && \
+	mkdir -p libbpf/pkg libbpf/src/build    && \
 	cd libbpf/src                           && \
 	BUILD_STATIC_ONLY=y OBJDIR=build DESTDIR=../pkg make install
 	
