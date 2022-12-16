@@ -1,26 +1,21 @@
+CC := clang
+CFLAGS := -target bpf -Wall
+DFLAGS := -O2 -g
 
+SRC := $(wildcard *.c)
+XDP_OBJ := $(patsubst %.c, %.o, $(SRC))
 
-all:
-	clang -Ilibbpf/pkg/usr/include -target bpf \
-		-g -O2 -Wall -c xdp_qppb.c -o xdp_qppb.o
-	clang -Ilibbpf/pkg/usr/include -target bpf \
-		-g -O2 -Wall -c xdp_tc.c -o xdp_tc.o
-	echo "ip link set dev <iface> xdp obj xdp_qppb.o"
+all: $(XDP_OBJ)
 
-prepare:
-	git submodule update --init --recursive && \
-	mkdir -p libbpf/pkg libbpf/src/build    && \
-	cd libbpf/src                           && \
-	BUILD_STATIC_ONLY=y OBJDIR=build DESTDIR=../pkg make install
-	
-	cd xdp-tools        && \
-	./configure && make && \
-	cp xdp-loader/xdp-loader ..
+%.o : %.c
+	$(CC) $(CFLAGS) $(DFLAGS) -c $<
 
 clean:
-	rm -v ./*.o xdp-loader
-	rm -rv libbpf xdp-tools
+	rm $(XDP_OBJ) || true
 
+#
+# Reference
+# ------------------------------------
 # clang -S \
 #     -target bpf \
 #     -D __BPF_TRACING__ \
@@ -50,4 +45,4 @@ clean:
 #       -O2 -emit-llvm -Xclang -disable-llvm-passes -c $HOME/Desktop/linux-next/samples/bpf/lwt_len_hist_kern.c -o - | \
 #       opt -O2 -mtriple=bpf-pc-linux | llvm-dis | \
 #       llc -march=bpf  -filetype=obj -o $HOME/Desktop/linux-next/samples/bpf/lwt_len_hist_kern.o
-# 
+#
